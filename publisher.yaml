@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Publishes messages to measure MQTT round-trip time
+Resources:
+  publish:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-publish"
+      Code:
+        ZipFile: >
+          const {IotData} = require('aws-sdk');
+          const numMessages = process.env.NUM_MESSAGES || 10;
+          exports.handler = (event, context, callback) => {
+            const region = context.invokedFunctionArn.split(':')[3];
+            const endpoint = process.env.IOT_ENDPOINT;
+            const iotEndpointRegion = endpoint.split('.')[2]
+            const iotData = new IotData({region: iotEndpointRegion, endpoint});
+            Promise
+              .all(Array.apply(null, Array(+numMessages)).map(() => iotData
+                .publish({
+                  topic: process.env.TOPIC || 'monitoring',
+                  payload: Buffer.from(JSON.stringify({
+                    $context: 'https://github.com/NordicPlayground/aws-iot-round-trip-time-monitor',
+                    created: new Date().toISOString(),
+                    region
+                  }))
+                })
+                .promise()))
+              .then(() => {
+                callback(null, `${numMessages} Messages published`)
+              })
+              .catch(err => {
+                console.error(err)
+                callback(err)
+              })
+          }
+      Description: Publishes messages to an MQTT topic
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Timeout: 15
+      Environment:
+        Variables:
+          TOPIC: !Ref Topic
+          IOT_ENDPOINT: !Ref IotEndpoint
+      Role: !GetAtt LambdaExecutionRole.Arn
+    DependsOn:
+    - LambdaExecutionRole
+  publishCron:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Executes the publish lambda function every minute
+      State: ENABLED
+      ScheduleExpression: rate(1 minute)
+      Targets:
+      - Id: publishLambda
+        Arn: !GetAtt publish.Arn
+    DependsOn:
+    - publish
+  publishCronPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt publish.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt publishCron.Arn
+    DependsOn:
+    - publish
+    - publishCron
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: LogToCloudWatch
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      - PolicyName: Metrics
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: "*"
+      - PolicyName: IoT
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - iot:Publish
+            Resource: !Join
+            - /
+            - - !Sub "arn:aws:iot:*:${AWS::AccountId}:topic"
+              - !Ref Topic
+Parameters:
+  Topic:
+    Description: Name of the MQTT topic to use for monitoring
+    Type: String
+    Default: monitoring
+  IotEndpoint:
+    Description: AWS IoT Endpoint to use (in the master zone)
+    Type: String
+    AllowedPattern: '^[a-z0-9]+\.iot\.[a-z0-9-]+\.amazonaws\.com$'

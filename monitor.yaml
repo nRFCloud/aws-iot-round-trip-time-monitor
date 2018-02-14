@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Monitors the round-trip time of AWS IoT messages.
+Resources:
+  receive:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-receive"
+      Code:
+        ZipFile: >
+          const {CloudWatch} = require('aws-sdk');
+          exports.handler = (event, context, callback) => {
+            const {$context, created, region: fromRegion} = event;
+            if ($context === 'https://github.com/NordicPlayground/aws-iot-round-trip-time-monitor') {
+              const now = new Date();
+              const rtt = now.getTime() - new Date(created).getTime();
+              const cw = new CloudWatch();
+              const region = context.invokedFunctionArn.split(':')[3];
+              const timeMetricName = fromRegion === region ? 'mqtt-roundtrip-time' : `mqtt-roundtrip-time-from-${fromRegion}`;
+              cw
+                .putMetricData({
+                  MetricData: [
+                    {
+                      MetricName: timeMetricName,
+                      StorageResolution: 60,
+                      Timestamp: now,
+                      Unit: 'Milliseconds',
+                      Value: rtt
+                    }
+                  ],
+                  Namespace: process.env.NAMESPACE
+                })
+                .promise()
+                .then(() => {
+                  callback(null, 'OK')
+                })
+            }
+          }
+      Description: Receives the MQTT messages and publishes the round-trip time as CloudWatch metrics
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Timeout: 15
+      Environment:
+        Variables:
+          NAMESPACE: !Ref Namespace
+      Role: !GetAtt LambdaExecutionRole.Arn
+    DependsOn:
+    - LambdaExecutionRole
+  receiveSubscription:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      TopicRulePayload:
+        AwsIotSqlVersion: 2016-03-23
+        Description: Processes MQTT roundtrip messages
+        RuleDisabled: false
+        Sql: !Join
+        - ''
+        - - "SELECT * FROM '"
+          - !Ref Topic
+          - "' WHERE created <> ''"
+        Actions:
+        - Lambda:
+            FunctionArn: !GetAtt receive.Arn
+    DependsOn:
+    - receive
+  receiveSubscriptionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt receive.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt receiveSubscription.Arn
+    DependsOn:
+    - receive
+    - receiveSubscription
+  describeIotEndpoint:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-describeIotEndpoint"
+      Code:
+        ZipFile: >
+          const aws = require("aws-sdk");
+          const response = require('cfn-response');
+          exports.handler = (event, context) => {
+              if (event.RequestType === "Delete") {
+                  sendResponse(event, context, "SUCCESS");
+                  return response.send(event, context, response.SUCCESS);
+              }
+              const iot = new aws.Iot();
+              iot.describeEndpoint({})
+                .promise()
+                .then(({endpointAddress}) => response.send(event, context, response.SUCCESS, { endpointAddress }, false, endpointAddress))
+                .catch(err => response.send(event, context, response.FAILED, { Error: `${err.message}  (${err})` }))
+          };
+      Description: Custom CloudFormation Resource which returns the AWS IoT endpoint
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+    DependsOn:
+    - LambdaExecutionRole
+  IotEndpoint:
+    Type: Custom::IotEndpoint
+    Properties:
+      ServiceToken: !GetAtt describeIotEndpoint.Arn
+    DependsOn:
+      - describeIotEndpoint
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: LogToCloudWatch
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      - PolicyName: Metrics
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:PutMetricData
+            Resource: "*"
+      - PolicyName: IoTDescribe
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: iot:DescribeEndpoint
+            Resource: "*"
+Parameters:
+  Namespace:
+    Description: Namespace to publish the metrics to
+    Type: String
+    Default: nrfcloud
+  Topic:
+    Description: Name of the MQTT topic to use for monitoring
+    Type: String
+    Default: monitoring
+Outputs:
+  Namespace:
+    Description: Namespace to publish the metrics to
+    Value: !Ref Namespace
+    Export:
+      Name: !Sub "${AWS::StackName}-Namespace"
+  Topic:
+    Description: Name of the MQTT topic to use for monitoring
+    Value: !Ref Topic
+    Export:
+      Name: !Sub "${AWS::StackName}-Topic"
+  IotEndpoint:
+    Description: AWS IoT Endpoint
+    Value: !GetAtt IotEndpoint.endpointAddress
+    Export:
+      Name: !Sub "${AWS::StackName}-IotEndpoint"
