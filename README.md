@@ -23,3 +23,5 @@ Install this as a stack in the *main region*.
 It creates a lambda function which subscribes to messages sent the 
 *monitoring* MQTT topic and calculates the round-trip time based on
 the timestamp in the message.
+
+The calculated round-trip times will be published as CloudWatch metrics.
